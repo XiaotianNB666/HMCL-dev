@@ -34,6 +34,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
@@ -432,7 +433,7 @@ public final class World {
         public final DimensionPath the_end;
 
         private final Map<DimensionPath, Set<Region>> worldCache = new ConcurrentHashMap<>();
-        private final ConcurrentHashMap<ChunkId, byte[]> chunkCache = new ConcurrentHashMap<>();
+        private final Map<ChunkId, Chunk> chunkCache = new ConcurrentHashMap<>();
 
         public final @NotNull World world;
 
@@ -475,7 +476,7 @@ public final class World {
         }
 
         private void initialRegionParse(@NotNull DimensionPath dimensionPath) throws RuntimeException {
-            try (Stream<Path> stream = Files.walk(dimensionPath.get())) {
+            try (Stream<Path> stream = Files.walk(dimensionPath.getRegionPath())) {
                 stream.filter(Files::isRegularFile)
                         .forEach(path -> {
                             String fileName = path.getFileName().toString();
@@ -483,7 +484,7 @@ public final class World {
                                 if (!worldCache.containsKey(dimensionPath)) {
                                     worldCache.put(dimensionPath, new HashSet<>());
                                 }
-                                worldCache.get(dimensionPath).add(new Region(new Chunk[1024], dimensionPath));
+                                worldCache.get(dimensionPath).add(new Region(new Chunk[1024], new RegionFile(dimensionPath, path.getFileName())));
                             }
                         });
             } catch (IOException e) {
@@ -497,20 +498,19 @@ public final class World {
                 worldCache.get(dimensionPath).forEach(region -> {
                     try {
                         parseChunks(region);
-                    } catch (Exception e) {
-                        LOG.warning("Failed to parse region file " + region.regionFile().get(), e);
+                    } catch (Exception ignored) {
                     }
                 });
             }
         }
 
         private static @Nullable ChunkId convertToChunkId(int regionChunkX, int regionChunkZ, @NotNull Region region) {
-            Matcher m = Region.REGION_GROUP_PATTERN.matcher(region.regionFile().get().getFileName().toString());
+            Matcher m = Region.REGION_GROUP_PATTERN.matcher(region.regionFile().getRegionPath().getFileName().toString());
             if (m.find()) {
                 int regionX = Integer.parseInt(m.group(1));
                 int regionZ = Integer.parseInt(m.group(2));
 
-                return new ChunkId(regionX * 32 + regionChunkX, regionZ * 32 + regionChunkZ, region.regionFile());
+                return new ChunkId(regionX * 32 + regionChunkX, regionZ * 32 + regionChunkZ, region.regionFile().dimensionPath);
             }
 
             return null;
@@ -523,8 +523,8 @@ public final class World {
             return head[4] & 0xFF;
         }
 
-        public static void parseChunks(@NotNull Region region) throws Exception {
-            byte[] header = Files.readAllBytes(region.regionFile().get());
+        public void parseChunks(@NotNull Region region) throws Exception {
+            byte[] header = Files.readAllBytes(region.regionFile().getRegionPath());
             if (header.length < HEADER_SIZE) {
                 throw new RuntimeException("Broken file head.");
             }
@@ -547,9 +547,9 @@ public final class World {
                 int compressionType = header[dataOffset + 4] & 0xFF;
                 if (dataOffset + 5 > header.length) {
                     LOG.warning("Region file <%s> has an invalid sector at index: <%d>; sector <%d> is out of bounds".formatted(
-                            region.regionFile().dimensionsPath.getFileName().toString(),
-                            i,
-                            dataOffset
+                                    region.regionFile().regionFile.getFileName().toString(),
+                                    i,
+                                    dataOffset
                             )
                     );
                     region.chunks()[i] = null;
@@ -566,15 +566,15 @@ public final class World {
                     // 区块数据在额外文件中
                     ChunkId cid = convertToChunkId(i / 32, i % 32, region);
                     if (cid != null) {
-                        compressedData = readFromExternalChunkFile(cid.chunkX(), cid.chunkZ(), region.regionFile());
+                        compressedData = readFromExternalChunkFile(cid.chunkX(), cid.chunkZ(), region.regionFile().dimensionPath);
                     } else {
                         region.chunks()[i] = null;
                         continue;
                     }
                 } else {
-                    compressedData = Files.readAllBytes(region.regionFile().get());
+                    compressedData = Files.readAllBytes(region.regionFile().getRegionPath());
                     if (dataOffset + 5 + dataLength > compressedData.length) {
-                        throw new RuntimeException("Illegal chunkId data");
+                        throw new RuntimeException("Illegal chunk data");
                     }
                 }
 
@@ -585,7 +585,8 @@ public final class World {
                         chunkNBT,
                         new ArrayList<>(),
                         compressionType,
-                        region
+                        region,
+                        this
                 );
             }
         }
@@ -645,106 +646,55 @@ public final class World {
             return null;
         }
 
-        @Deprecated
-        public byte[] parseChunk(int chunkX, int chunkZ, DimensionPath dimensionPath) throws RuntimeException {
-            try {
-                int regionX = chunkX >> 5;
-                int regionZ = chunkZ >> 5;
-                int localX = chunkX & 0x1F;
-                int localZ = chunkZ & 0x1F;
+        public static String parseBlockFromSection(@NotNull ChunkSection chunkSection, int x, int y, int z) {
+            int localY = y & 0xF;
+            int index = (localY << 8) | (z << 4) | x; // y * 16 * 16 + z * 16 + x
 
-                String regionFile = String.format("r.%d.%d.mca", regionX, regionZ);
-                Path regionPath = dimensionPath.get().resolve(Paths.get("region", regionFile));
-
-                if (!Files.exists(regionPath)) {
-                    throw new RuntimeException("Region file does not exists.");
-                }
-
-                byte[] header = Files.readAllBytes(regionPath);
-                if (header.length < HEADER_SIZE) {
-                    throw new RuntimeException("Broken file head.");
-                }
-
-                int blockIndex = localX + 32 * localZ;
-                int headerOffset = blockIndex * 4;
-
-                int sectorOffset = ((header[headerOffset] & 0xFF) << 16)
-                        | ((header[headerOffset + 1] & 0xFF) << 8)
-                        | (header[headerOffset + 2] & 0xFF);
-
-                int sectorCount = header[headerOffset + 3] & 0xFF;
-
-                if (sectorOffset == 0 || sectorCount == 0) {
-                    return new byte[] {};
-                }
-
-                int dataOffset = sectorOffset * SECTOR_SIZE;
-                int compressionType = header[dataOffset + 4] & 0xFF;
-                if (dataOffset + 5 > header.length) {
-                    // 数据可能在额外文件中
-                    return readFromExternalChunkFile(chunkX, chunkZ, dimensionPath);
-                }
-
-                int dataLength = ((header[dataOffset] & 0xFF) << 24)
-                        | ((header[dataOffset + 1] & 0xFF) << 16)
-                        | ((header[dataOffset + 2] & 0xFF) << 8)
-                        | (header[dataOffset + 3] & 0xFF);
-
-                if ((compressionType & 0x80) != 0) {
-                    return readFromExternalChunkFile(chunkX, chunkZ, dimensionPath);
-                }
-
-                byte[] compressedData = Files.readAllBytes(regionPath);
-                if (dataOffset + 5 + dataLength > compressedData.length) {
-                    throw new RuntimeException("Illegal chunkId data");
-                }
-
-                byte[] chunkData = decompressData(
-                        Arrays.copyOfRange(compressedData, dataOffset + 5, dataOffset + 5 + dataLength),
-                        compressionType
-                );
-
-                ChunkId chunkId = new ChunkId(chunkX, chunkZ, dimensionPath);
-                chunkCache.put(chunkId, chunkData);
-
-                return chunkData;
-            } catch (Exception e) {
-                throw new RuntimeException(e);
+            int paletteIndex = Math.toIntExact(chunkSection.data[index]);
+            if (paletteIndex < 0 || paletteIndex >= chunkSection.palette.length) {
+                return "minecraft:air";
             }
+            return chunkSection.palette[paletteIndex];
         }
 
-        @Deprecated
-        public String parseBlockFromChunkData(int chunkX, int chunkZ, int x, int y, int z, DimensionPath dimensionPath) {
-            ChunkId chunkId = new ChunkId(chunkX, chunkZ, dimensionPath);
-            byte[] data = null;
-            if (!chunkCache.containsKey(chunkId)) {
-                data = parseChunk(chunkX, chunkZ, dimensionPath);
+        public ChunkSection getHighestNonEmptySection(@NotNull Chunk chunk) {
+            for (ChunkSection section : chunk.chunkSections.reversed()) {
+                if (section != null && section.data.length > 0 && section.palette.length > 0) {
+                    return section;
+                }
             }
-            return parseBlockFromChunkData(data == null ? chunkCache.get(chunkId) : data, x, y, z);
+            return null;
         }
 
-        /*
-        * @throws EOFException if chunkId data is not found or not generated by MC
-        */
-        public String parseBlockFromChunkData(@NotNull World.WorldParser.ChunkId chunkId, int x, int y, int z) {
-            byte[] data = null;
-            if (!chunkCache.containsKey(chunkId)) {
-                data = parseChunk(chunkId.chunkX, chunkId.chunkZ, chunkId.world);
+        public String getSectionHighestNonAirBlock(@NotNull Chunk chunk, int x, int z) {
+            ChunkSection section = getHighestNonEmptySection(chunk);
+            if (section != null) {
+                for (int y = section.y * 16 + 15; y >= section.y * 16; y--) {
+                    String block = parseBlockFromSection(section, x, y, z);
+                    if (isNotAirBlock(block)) {
+                        return block;
+                    }
+                }
+                ChunkSection[] filteredSections = (ChunkSection[]) chunk.chunkSections.reversed().stream().filter(
+                        chunkSection -> chunkSection.equals(section)
+                ).toArray(); // most of the sections will not reach there, so the performance loss caused by this is acceptable
+                for (ChunkSection s : filteredSections) {
+                    if (s != null && s.data.length > 0 && s.palette.length > 0) {
+                        for (int y = s.y * 16 + 15; y >= s.y * 16; y--) {
+                            String block = parseBlockFromSection(s, x, y, z);
+                            if (isNotAirBlock(block)) {
+                                return block;
+                            }
+                        }
+                    }
+                }
             }
-            return parseBlockFromChunkData(data == null ? chunkCache.get(chunkId) : data, x, y, z);
-        }
-
-        public String parseBlockFromChunkData(byte[] chunkData, int x, int y, int z) {
-            try {
-                return parseBlockFromNBT(NBTIO.readTag(new ByteArrayInputStream(chunkData)), x, y, z);
-            } catch (IOException e) {
-                throw new RuntimeException(e);
-            }
+            return "minecraft:air";
         }
 
         private static byte[] readFromExternalChunkFile(int chunkX, int chunkZ, DimensionPath dimensionPath) {
             try {
-                Path externalPath = dimensionPath.get().resolve(Paths.get(String.format("c.%d.%d.mcc", chunkX, chunkZ)));
+                Path externalPath = dimensionPath.getRegionPath().resolve(Paths.get(String.format("c.%d.%d.mcc", chunkX, chunkZ)));
 
                 if (!Files.exists(externalPath)) {
                     throw new RuntimeException("External region file not found.");
@@ -786,217 +736,25 @@ public final class World {
             return Arrays.copyOfRange(data, 4, data.length);
         }
 
-        private @Nullable String parseBlockFromNBT(@NotNull Tag chunkData, int x, int y, int z) {
-            if (!(chunkData instanceof CompoundTag chunk)) {
-                return null;
-            }
-
-            x &= 15;
-            z &= 15;
-
-            if (!chunk.contains("chunkSections")) {
-                return null;
-            }
-
-            ListTag sections = chunk.get("chunkSections");
-            if (sections.size() <= 0) {
-                return null;
-            }
-
-            int sectionY = y >> 4;
-            int localY = y & 15;
-
-            for (int i = 0; i < sections.size(); i++) {
-                Tag sectionTag = sections.get(i);
-                if (!(sectionTag instanceof CompoundTag section)) {
-                    continue;
-                }
-
-                if (!section.contains("Y") || !(section.get("Y") instanceof ByteTag)) {
-                    continue;
-                }
-
-                byte sectionYValue = ((ByteTag) section.get("Y")).getValue();
-                if (sectionYValue != sectionY) {
-                    continue;
-                }
-
-                if (!section.contains("block_states") || !(section.get("block_states") instanceof CompoundTag blockStates)) {
-                    return "minecraft:air";
-                }
-
-                if (!blockStates.contains("palette") || !(blockStates.get("palette") instanceof ListTag palette)) {
-                    return "minecraft:air";
-                }
-
-                if (palette.size() <= 0) {
-                    return "minecraft:air";
-                }
-
-                if (!blockStates.contains("data") || !(blockStates.get("data") instanceof LongArrayTag dataArray)) {
-                    Tag firstBlock = palette.get(0);
-                    if (firstBlock instanceof CompoundTag blockEntry) {
-                        if (blockEntry.contains("Name") && blockEntry.get("Name") instanceof StringTag nameTag) {
-                            return nameTag.getValue();
-                        }
-                    }
-                    return "minecraft:air";
-                }
-
-                long[] data = dataArray.getValue();
-                int index3D = localY * 256 + z * 16 + x;
-                int longIndex = index3D >> 6;
-                int bitOffset = (index3D & 63);
-
-                if (longIndex >= data.length) {
-                    return "minecraft:air";
-                }
-
-                long value = data[longIndex];
-                int paletteIndex = (int) ((value >>> bitOffset) & 0x3F);
-
-                if (paletteIndex >= palette.size()) {
-                    paletteIndex = 0;
-                }
-
-                Tag blockTag = palette.get(paletteIndex);
-                if (blockTag instanceof CompoundTag blockEntry) {
-                    if (blockEntry.contains("Name") && blockEntry.get("Name") instanceof StringTag nameTag) {
-                        return nameTag.getValue();
-                    }
-                }
-
-                return "minecraft:air";
-            }
-            return "minecraft:air";
+        private boolean isNotAirBlock(String blockName) {
+            return !"minecraft:air".equals(blockName) &&
+                    !blockName.startsWith("minecraft:cave_air") &&
+                    !blockName.startsWith("minecraft:void_air") &&
+                    !blockName.isEmpty();
         }
 
-        /**
-         * 获取指定区块内某个位置的最高非空气方块
-         * @param chunkId 区块对象
-         * @param x 区块内X坐标 (0-15)
-         * @param z 区块内Z坐标 (0-15)
-         * @return 最高非空气方块的Y坐标，如果没有找到则返回Integer.MIN_VALUE
-         */
-        public int getTheHighestNonAirBlock(ChunkId chunkId, int x, int z) {
-            x &= 15;
-            z &= 15;
-
-            // 尝试从缓存获取区块数据
-            byte[] chunkData = chunkCache.get(chunkId);
-            if (chunkData == null) {
-                try {
-                    chunkData = parseChunk(chunkId.chunkX, chunkId.chunkZ, chunkId.world);
-                } catch (RuntimeException e) {
-                    return Integer.MIN_VALUE;
-                }
-            }
-
-            try {
-                // 一次性解析整个区块的NBT数据
-                CompoundTag chunkTag = (CompoundTag) NBTIO.readTag(new ByteArrayInputStream(chunkData));
-
-                if (!chunkTag.contains("chunkSections")) {
-                    return Integer.MIN_VALUE;
-                }
-
-                ListTag sections = chunkTag.get("chunkSections");
-
-                // 从最高section开始向下搜索（优化搜索顺序）
-                for (int sectionIndex = sections.size() - 1; sectionIndex >= 0; sectionIndex--) {
-                    Tag sectionTag = sections.get(sectionIndex);
-                    if (!(sectionTag instanceof CompoundTag section)) {
-                        continue;
-                    }
-
-                    if (!section.contains("Y") || !(section.get("Y") instanceof ByteTag sectionYTag)) {
-                        continue;
-                    }
-
-                    int sectionBaseY = sectionYTag.getValue() * 16;
-
-                    // 处理block_states
-                    if (!section.contains("block_states") || !(section.get("block_states") instanceof CompoundTag blockStates)) {
-                        continue;
-                    }
-
-                    ListTag palette = null;
-                    LongArrayTag dataArray = null;
-
-                    if (blockStates.contains("palette") && blockStates.get("palette") instanceof ListTag paletteTag) {
-                        palette = paletteTag;
-                    }
-                    if (blockStates.contains("data") && blockStates.get("data") instanceof LongArrayTag dataArrayTag) {
-                        dataArray = dataArrayTag;
-                    }
-
-                    // 在当前section内从最高处向最低处搜索
-                    for (int localY = 15; localY >= 0; localY--) {
-                        String blockName = getBlockNameAtPosition(palette, dataArray, x, localY, z);
-
-                        if (blockName != null && !isAirBlock(blockName)) {
-                            return sectionBaseY + localY;
-                        }
-                    }
-                }
-
-                return Integer.MIN_VALUE;
-
-            } catch (IOException e) {
-                return Integer.MIN_VALUE;
-            }
+        public @Nullable Chunk getChunk(@NotNull ChunkId id) {
+            return chunkCache.getOrDefault(id, null);
         }
 
-        /**
-         * 获取指定位置的方块名称
-         */
-        private String getBlockNameAtPosition(ListTag palette, LongArrayTag dataArray, int x, int localY, int z) {
-            if (palette == null || palette.size() == 0) {
-                return "minecraft:air";
-            }
-
-            // 如果只有调色板没有数据数组，返回调色板第一个方块
-            if (dataArray == null) {
-                Tag firstBlock = palette.get(0);
-                if (firstBlock instanceof CompoundTag blockEntry &&
-                        blockEntry.contains("Name") && blockEntry.get("Name") instanceof StringTag nameTag) {
-                    return nameTag.getValue();
-                }
-                return "minecraft:air";
-            }
-
-            long[] data = dataArray.getValue();
-            int index3D = localY * 256 + z * 16 + x;
-            int longIndex = index3D >> 6;
-            int bitOffset = index3D & 63;
-
-            if (longIndex >= data.length) {
-                return "minecraft:air";
-            }
-
-            long value = data[longIndex];
-            int bitsPerBlock = Math.max(4, 32 - Integer.numberOfLeadingZeros(palette.size() - 1));
-            int paletteIndex = (int)((value >>> bitOffset) & ((1L << bitsPerBlock) - 1));
-
-            if (paletteIndex >= palette.size()) {
-                paletteIndex = 0;
-            }
-
-            Tag blockTag = palette.get(paletteIndex);
-            if (blockTag instanceof CompoundTag blockEntry) {
-                if (blockEntry.contains("Name") && blockEntry.get("Name") instanceof StringTag nameTag) {
-                    return nameTag.getValue();
+        public @NotNull Chunk getOrParseChunk(@NotNull ChunkId id) {
+            if (!chunkCache.containsKey(id)) {
+                regionParse(id.world);
+                if (!chunkCache.containsKey(id)) {
+                    throw new RuntimeException("Chunk not found after parsing region: " + id);
                 }
             }
-
-            return "minecraft:air";
-        }
-
-        private boolean isAirBlock(String blockName) {
-            return "minecraft:air".equals(blockName) ||
-                    blockName.startsWith("minecraft:cave_air") ||
-                    blockName.startsWith("minecraft:void_air") ||
-                    blockName.isEmpty();
+            return chunkCache.get(id);
         }
 
         public DimensionPath getOverworld() {
@@ -1019,12 +777,17 @@ public final class World {
         public record ChunkId(int chunkX, int chunkZ, DimensionPath world) {
         }
 
-        public record Chunk(ChunkId id, Tag chunkNBT, List<ChunkSection> chunkSections, int compressionType, Region region) { }
+        public record Chunk(ChunkId id, Tag chunkNBT, List<ChunkSection> chunkSections, int compressionType, Region region) {
+            public Chunk(ChunkId id, Tag chunkNBT, List<ChunkSection> chunkSections, int compressionType, Region region, WorldParser worldParser) {
+                this(id, chunkNBT, chunkSections, compressionType, region);
+                worldParser.chunkCache.put(id, this);
+            }
+        }
 
         public record ChunkSection(Chunk chunkParent, byte y, String[] palette, long[] data) {
         }
 
-        public record Region(Chunk[] chunks, DimensionPath regionFile) {
+        public record Region(Chunk[] chunks, RegionFile regionFile) {
             public static final Pattern MCA_FILE_PATTERN = Pattern.compile("^r\\.-?\\d+\\.-?\\d+\\.mca$");
             public static final Pattern REGION_GROUP_PATTERN = Pattern.compile("^r\\.(?<regionX>-?\\d+)\\.(?<regionZ>-?\\d+)\\.mca$");
         }
@@ -1037,13 +800,19 @@ public final class World {
                 return new DimensionPath(dimensionsPath, worldType, world, yMax, yMin);
             }
 
-            public Path get() {
-                return dimensionsPath;
+            public Path getRegionPath() {
+                return dimensionsPath.resolve("region");
             }
-            
+
             @Override
             public @NotNull String toString() {
                 return String.format("DimensionPath<%s>{%s}", worldType, dimensionsPath);
+            }
+        }
+
+        public record RegionFile(DimensionPath dimensionPath, Path regionFile) {
+            public @NotNull Path getRegionPath() {
+                return dimensionPath.getRegionPath().resolve(regionFile);
             }
         }
     }

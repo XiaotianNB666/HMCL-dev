@@ -398,14 +398,8 @@ public class WorldViewPage extends DecoratorAnimatedPage implements DecoratorPag
                         try {
                             for (int x = 0; x < 16; x++) {
                                 for (int z = 0; z < 16; z++) {
-                                    int y = worldParser.getTheHighestNonAirBlock(chunkId, x, z);
-                                    if (y != Integer.MIN_VALUE) {
-                                        LOG.debug("Parsed block at chunkId(%d,%d) [%d, %d, %d] world pos (%d,%d,%d) : %s".formatted(
-                                                chunkId.chunkX(), chunkId.chunkZ(), x, y, z, chunkId.chunkX() * 16 + x, y, chunkId.chunkZ() * 16 + z,
-                                                worldParser.parseBlockFromChunkData(chunkId, x, y, z)
-                                        ));
-                                    }
-                                    chunkColors[x * 16 + z] = getColor(worldParser.parseBlockFromChunkData(chunkId, x, y != Integer.MIN_VALUE ? y : 64, z));
+                                    String block = worldParser.getSectionHighestNonAirBlock(worldParser.getOrParseChunk(chunkId), x, z);
+                                    chunkColors[x * 16 + z] = getColor(block);
                                 }
                             }
                             if (detailed) {
